@@ -1,0 +1,156 @@
+name: Validate Submission PR
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "submissions/**"
+
+jobs:
+  validate:
+    name: Validate Submission
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Validate all submissions in PR
+        id: validate
+        run: |
+          set +e
+          ERRORS=()
+          VALID_TYPES=("notes" "papers" "syllabus" "practicals")
+          VALID_PAPER_TYPES=("Sessional" "University" "Pre University" "Other")
+          VALID_BRANCHES=("CSE" "AIML" "ECE" "IT" "ME" "CE" "EE")
+          FOUND_SUBMISSION=false
+
+          # Find all submission folders (those containing a metadata.json)
+          while IFS= read -r metadata_file; do
+            FOUND_SUBMISSION=true
+            dir=$(dirname "$metadata_file")
+            folder_name=$(basename "$dir")
+
+            if ! jq empty "$metadata_file" 2>/dev/null; then
+              ERRORS+=("[$folder_name] metadata.json is not valid JSON.")
+              continue
+            fi
+
+            type=$(jq -r '.type // empty' "$metadata_file")
+            title=$(jq -r '.title // empty' "$metadata_file")
+            subject=$(jq -r '.subject // empty' "$metadata_file")
+            branch=$(jq -r '.branch // empty' "$metadata_file")
+            semester=$(jq -r '.semester // empty' "$metadata_file")
+            year=$(jq -r '.year // empty' "$metadata_file")
+            paperType=$(jq -r '.paperType // empty' "$metadata_file")
+
+            for field in type title branch semester; do
+              val=$(jq -r ".$field // empty" "$metadata_file")
+              if [ -z "$val" ]; then
+                ERRORS+=("[$folder_name] Missing required field: '$field'.")
+              fi
+            done
+
+            if [ -n "$type" ]; then
+              type_lower=$(echo "$type" | tr '[:upper:]' '[:lower:]')
+              if [ "$type" != "$type_lower" ]; then
+                ERRORS+=("[$folder_name] 'type' must be lowercase. Got: '$type'. Expected: '$type_lower'.")
+              fi
+
+              valid_type=false
+              for vt in "${VALID_TYPES[@]}"; do
+                [ "$type_lower" = "$vt" ] && valid_type=true && break
+              done
+              if [ "$valid_type" = false ]; then
+                ERRORS+=("[$folder_name] Invalid 'type': '$type'. Must be one of: ${VALID_TYPES[*]}.")
+              fi
+            fi
+
+            if [ -n "$type" ] && [ "$type" != "syllabus" ] && [ -z "$subject" ]; then
+              ERRORS+=("[$folder_name] Missing required field: 'subject' (required for type '$type').")
+            fi
+
+            if [ "$type" = "papers" ]; then
+              if [ -z "$year" ]; then
+                ERRORS+=("[$folder_name] Missing required field: 'year' (required for type 'papers').")
+              else
+                if ! echo "$year" | grep -qE '^[0-9]{4}$'; then
+                  ERRORS+=("[$folder_name] 'year' must be a 4-digit number. Got: '$year'.")
+                fi
+              fi
+
+              if [ -n "$paperType" ]; then
+                valid_pt=false
+                for vpt in "${VALID_PAPER_TYPES[@]}"; do
+                  [ "$paperType" = "$vpt" ] && valid_pt=true && break
+                done
+                if [ "$valid_pt" = false ]; then
+                  ERRORS+=("[$folder_name] Invalid 'paperType': '$paperType'. Must be one of: ${VALID_PAPER_TYPES[*]}.")
+                fi
+              fi
+            fi
+
+            if [ -n "$branch" ]; then
+              branch_upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
+              if [ "$branch" != "$branch_upper" ]; then
+                ERRORS+=("[$folder_name] 'branch' must be uppercase. Got: '$branch'. Expected: '$branch_upper'.")
+              fi
+            fi
+
+            if [ -n "$semester" ]; then
+              if ! echo "$semester" | grep -qE '^[0-9]+$'; then
+                ERRORS+=("[$folder_name] 'semester' must be a number. Got: '$semester'.")
+              fi
+            fi
+
+            if [ -n "$title" ]; then
+              trimmed=$(echo "$title" | tr -d '[:space:]')
+              if [ -z "$trimmed" ]; then
+                ERRORS+=("[$folder_name] 'title' must not be blank or whitespace-only.")
+              fi
+            fi
+
+            pdf_count=$(find "$dir" -maxdepth 1 -iname "*.pdf" | wc -l)
+            if [ "$pdf_count" -eq 0 ]; then
+              ERRORS+=("[$folder_name] No PDF file found in submission folder.")
+            elif [ "$pdf_count" -gt 1 ]; then
+              ERRORS+=("[$folder_name] Multiple PDFs found ($pdf_count). Only one PDF per folder is allowed.")
+            fi
+
+            extra=$(find "$dir" -maxdepth 1 -type f ! -iname "*.pdf" ! -name "metadata.json")
+            if [ -n "$extra" ]; then
+              ERRORS+=("[$folder_name] Unexpected files found (only metadata.json + one PDF allowed): $(echo "$extra" | tr '\n' ' ')")
+            fi
+
+            KNOWN_KEYS='["type","title","subject","branch","semester","year","paperType"]'
+            unknown_keys=$(jq --argjson known "$KNOWN_KEYS" '
+              keys - $known | .[]
+            ' "$metadata_file" 2>/dev/null)
+            if [ -n "$unknown_keys" ]; then
+              ERRORS+=("[$folder_name] Unknown keys in metadata.json: $unknown_keys")
+            fi
+
+            echo "Checks complete for $folder_name"
+
+          done < <(find submissions -name "metadata.json" 2>/dev/null)
+
+          echo ""
+          if [ "$FOUND_SUBMISSION" = false ]; then
+            echo "No submission folders found in submissions/. Nothing to validate."
+            exit 0
+          fi
+
+          if [ ${#ERRORS[@]} -gt 0 ]; then
+            echo ""
+            echo "Validation failed with ${#ERRORS[@]} error(s):"
+            echo ""
+            for err in "${ERRORS[@]}"; do
+              echo "  • $err"
+            done
+            echo ""
+            echo "Please fix the above issues and push again."
+            exit 1
+          else
+            echo ""
+            echo "All submissions passed validation!"
+          fi
